@@ -1,0 +1,363 @@
+<!--written by chatgpt-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Display Bounds Mapterhorn</title>
+
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/maplibre-gl@5.6.2/dist/maplibre-gl.css"
+  />
+
+  <style>
+    html, body, #map {
+      height: 100%;
+      margin: 0;
+    }
+
+    #status {
+      position: absolute;
+      z-index: 1000;
+      top: 10px;
+      left: 50px;
+      background: white;
+      padding: 8px 12px;
+      border-radius: 4px;
+      box-shadow: 0 1px 5px #888;
+      font: 14px sans-serif;
+      max-width: calc(100vw - 100px);
+      overflow-wrap: anywhere;
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="status">Loading bounds.csv…</div>
+
+  <script src="https://unpkg.com/maplibre-gl@5.6.2/dist/maplibre-gl.js"></script>
+
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const source = params.get("source") || "aalv";
+
+    const TAR_URL =
+      `https://download.mapterhorn.com/sources/${encodeURIComponent(source)}.tar`;
+
+    const CHUNK_SIZE = 64 * 1024;
+    const decoder = new TextDecoder();
+
+    function toWGS84(x, y) {
+      const R = 6378137;
+
+      const lon = (x / R) * (180 / Math.PI);
+      const lat = (
+        2 * Math.atan(Math.exp(y / R)) - Math.PI / 2
+      ) * (180 / Math.PI);
+
+      return [lon, lat];
+    }
+
+    const map = new maplibregl.Map({
+      container: "map",
+      center: [24.1, 56.95],
+      hash: "map",
+      zoom: 7,
+      style: {
+        version: 8,
+        sources: {
+          osm: {
+            type: "raster",
+            tiles: [
+              "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+            ],
+            tileSize: 256,
+            attribution:
+              '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+          }
+        },
+        layers: [
+          {
+            id: "osm-tiles",
+            type: "raster",
+            source: "osm"
+          }
+        ]
+      }
+    });
+
+    map.addControl(
+      new maplibregl.NavigationControl(),
+      "top-right"
+    );
+
+    function parseTarHeader(header) {
+      const name = decoder.decode(header.subarray(0, 100))
+        .replace(/\0.*$/, "");
+
+      const sizeText = decoder.decode(header.subarray(124, 136))
+        .replace(/\0.*$/, "").trim();
+
+      const size = parseInt(sizeText || "0", 8);
+
+      if (!Number.isSafeInteger(size) || size < 0) {
+        throw new Error("Invalid TAR entry size: " + name);
+      }
+
+      return { name, size };
+    }
+
+    async function fetchRange(start, end) {
+      const response = await fetch(TAR_URL, {
+        headers: { Range: `bytes=${start}-${end}` }
+      });
+
+      if (response.status !== 206) {
+        throw new Error(
+          `Expected HTTP 206 for byte range, got ${response.status}`
+        );
+      }
+
+      const bytes = new Uint8Array(await response.arrayBuffer());
+
+      if (bytes.length !== end - start + 1) {
+        throw new Error("Incomplete byte-range response");
+      }
+
+      return bytes;
+    }
+
+    // Scan TAR headers using bounded range requests.
+    // Download only the CSV once its header is found.
+    async function loadBoundsCSV() {
+      let offset = 0;
+
+      while (true) {
+        const bytes = await fetchRange(
+          offset, offset + CHUNK_SIZE - 1
+        );
+
+        let pos = 0;
+        let foundNextHeader = false;
+
+        while (pos + 512 <= bytes.length) {
+          const header = bytes.subarray(pos, pos + 512);
+
+          if (header.every(b => b === 0)) {
+            throw new Error("bounds.csv not found in TAR archive");
+          }
+
+          const { name, size } = parseTarHeader(header);
+          const dataStart = offset + pos + 512;
+          const nextHeader =
+            dataStart + Math.ceil(size / 512) * 512;
+
+          if (name === "bounds.csv" || name.endsWith("/bounds.csv")) {
+            if (size > 100 * 1024 * 1024) {
+              throw new Error("Unexpectedly large bounds.csv");
+            }
+
+            if (size === 0) {
+              return "";
+            }
+
+            const csvBytes = await fetchRange(
+              dataStart, dataStart + size - 1
+            );
+
+            return decoder.decode(csvBytes);
+          }
+
+          if (nextHeader >= offset + bytes.length) {
+            offset = nextHeader;
+            foundNextHeader = true;
+            break;
+          }
+
+          pos = nextHeader - offset;
+        }
+
+        if (!foundNextHeader) {
+          if (bytes.length < CHUNK_SIZE) {
+            throw new Error("End of archive reached");
+          }
+
+          offset += bytes.length;
+        }
+      }
+    }
+
+    function parseCSV(text) {
+      // Sufficient for this numeric CSV with simple filenames.
+      const lines = text.trim().split(/\r?\n/);
+
+      if (!lines[0]) {
+        return [];
+      }
+
+      const headers = lines.shift().split(",")
+        .map(s => s.trim());
+
+      return lines.filter(line => line.trim()).map(line => {
+        const values = line.split(",");
+
+        return Object.fromEntries(
+          headers.map((key, i) => [key, values[i]?.trim()])
+        );
+      });
+    }
+
+    function rowToFeature(row) {
+      const left = Number(row.left);
+      const bottom = Number(row.bottom);
+      const right = Number(row.right);
+      const top = Number(row.top);
+
+      if (![left, bottom, right, top].every(Number.isFinite)) {
+        throw new Error("Invalid bounds for " + row.filename);
+      }
+
+      // GeoJSON coordinates are [longitude, latitude].
+      const ring = [
+        toWGS84(left, bottom),
+        toWGS84(right, bottom),
+        toWGS84(right, top),
+        toWGS84(left, top),
+        toWGS84(left, bottom)
+      ];
+
+      return {
+        type: "Feature",
+        properties: {
+          filename: row.filename,
+          width: Number(row.width),
+          height: Number(row.height)
+        },
+        geometry: {
+          type: "Polygon",
+          coordinates: [ring]
+        }
+      };
+    }
+
+    async function main() {
+      const csv = await loadBoundsCSV();
+      const rows = parseCSV(csv);
+      const features = rows.map(rowToFeature);
+
+      const geojson = {
+        type: "FeatureCollection",
+        features
+      };
+
+      // Wait until the map style is ready before adding sources.
+      if (!map.isStyleLoaded()) {
+        await new Promise(resolve => map.once("load", resolve));
+      }
+
+      map.addSource("dtm-bounds", {
+        type: "geojson",
+        data: geojson
+      });
+
+      // Polygon fill.
+      map.addLayer({
+        id: "dtm-bounds-fill",
+        type: "fill",
+        source: "dtm-bounds",
+        paint: {
+          "fill-color": "#ff595e",
+          "fill-opacity": 0.25
+        }
+      });
+
+      // Polygon outline.
+      map.addLayer({
+        id: "dtm-bounds-outline",
+        type: "line",
+        source: "dtm-bounds",
+        paint: {
+          "line-color": "#e63946",
+          "line-width": 2
+        }
+      });
+
+      const popup = new maplibregl.Popup({
+        closeButton: true,
+        closeOnClick: true
+      });
+
+      map.on("click", "dtm-bounds-fill", event => {
+        const clicked = map.queryRenderedFeatures(event.point, {
+          layers: ["dtm-bounds-fill"]
+        });
+
+        const filenames = [
+          ...new Set(
+            clicked.map(f => f.properties.filename)
+          )
+        ];
+
+        console.log("Clicked filename(s):", filenames);
+
+        if (filenames.length) {
+          const content = document.createElement("div");
+
+          // Use textContent to avoid interpreting filenames as HTML.
+          const title = document.createElement("strong");
+          title.textContent = filenames.join(", ");
+          content.appendChild(title);
+
+          popup
+            .setLngLat(event.lngLat)
+            .setDOMContent(content)
+            .addTo(map);
+        }
+      });
+
+      // Change cursor when hovering over polygons.
+      map.on("mouseenter", "dtm-bounds-fill", () => {
+        map.getCanvas().style.cursor = "pointer";
+      });
+
+      map.on("mouseleave", "dtm-bounds-fill", () => {
+        map.getCanvas().style.cursor = "";
+      });
+
+      // Fit the map to the complete GeoJSON bounds.
+      if (features.length) {
+        const bounds = new maplibregl.LngLatBounds();
+
+        for (const feature of features) {
+          for (const ring of feature.geometry.coordinates) {
+            for (const coordinate of ring) {
+              bounds.extend(coordinate);
+            }
+          }
+        }
+
+        if (!bounds.isEmpty()) {
+          map.fitBounds(bounds, {
+            padding: 20,
+            maxZoom: 15,
+            duration: 0
+          });
+        }
+      }
+
+      document.getElementById("status").textContent =
+        `Loaded ${features.length} polygon(s)`;
+
+      console.log("GeoJSON:", geojson);
+    }
+
+    main().catch(error => {
+      console.error(error);
+
+      document.getElementById("status").textContent =
+        "Error: " + error.message;
+    });
+  </script>
+</body>
+</html>
